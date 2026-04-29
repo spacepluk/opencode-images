@@ -1,0 +1,8 @@
+node_modules/
+.opencode/
+.git/
+.gitignore
+bun.lock
+*.log
+tsconfig.json
+tui.json

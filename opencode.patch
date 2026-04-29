@@ -1,0 +1,85 @@
+diff --git a/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx b/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx
+index d43edd2dd..cddd29719 100644
+--- a/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx
++++ b/packages/opencode/src/cli/cmd/tui/routes/session/index.tsx
+@@ -1299,6 +1299,17 @@ function UserMessage(props: {
+             flexShrink={0}
+           >
+             <text fg={theme.text}>{text()}</text>
++            <For each={props.parts.filter((x) => x.type === "text" && !x.synthetic)}>
++              {(part) => (
++                <TuiPluginRuntime.Slot
++                  name="message_part_after"
++                  session_id={props.message.sessionID}
++                  message_id={props.message.id}
++                  part_id={part.id}
++                  part_type="text"
++                />
++              )}
++            </For>
+             <Show when={files().length}>
+               <box flexDirection="row" paddingBottom={metadataVisible() ? 1 : 0} paddingTop={1} gap={1} flexWrap="wrap">
+                 <For each={files()}>
+@@ -1475,6 +1486,13 @@ function ReasoningPart(props: { last: boolean; part: ReasoningPart; message: Ass
+           conceal={ctx.conceal()}
+           fg={theme.textMuted}
+         />
++        <TuiPluginRuntime.Slot
++          name="message_part_after"
++          session_id={props.message.sessionID}
++          message_id={props.message.id}
++          part_id={props.part.id}
++          part_type="reasoning"
++        />
+       </box>
+     </Show>
+   )
+@@ -1509,6 +1527,13 @@ function TextPart(props: { last: boolean; part: TextPart; message: AssistantMess
+             />
+           </Match>
+         </Switch>
++        <TuiPluginRuntime.Slot
++          name="message_part_after"
++          session_id={props.message.sessionID}
++          message_id={props.message.id}
++          part_id={props.part.id}
++          part_type="text"
++        />
+       </box>
+     </Show>
+   )
+@@ -1596,6 +1621,15 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
+           <GenericTool {...toolprops} />
+         </Match>
+       </Switch>
++      <TuiPluginRuntime.Slot
++        name="message_part_after"
++        session_id={props.message.sessionID}
++        message_id={props.message.id}
++        part_id={props.part.id}
++        part_type="tool"
++        tool_name={props.part.tool}
++        tool_output={props.part.state.status === "completed" ? props.part.state.output : undefined}
++      />
+     </Show>
+   )
+ }
+diff --git a/packages/plugin/src/tui.ts b/packages/plugin/src/tui.ts
+index 1c57a71ab..3c7ec93b4 100644
+--- a/packages/plugin/src/tui.ts
++++ b/packages/plugin/src/tui.ts
+@@ -351,6 +351,14 @@ export type TuiHostSlotMap = {
+   sidebar_footer: {
+     session_id: string
+   }
++  message_part_after: {
++    session_id: string
++    message_id: string
++    part_id: string
++    part_type: "text" | "reasoning" | "tool"
++    tool_name?: string
++    tool_output?: string
++  }
+ }
+ 
+ export type TuiSlotMap<Slots extends Record<string, object> = {}> = TuiHostSlotMap & Slots
