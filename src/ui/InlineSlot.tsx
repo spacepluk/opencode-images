@@ -23,6 +23,9 @@ export type InlineSlotProps = {
   maxCellWidth: number
   maxCellHeight: number
   maxTransmitBytes?: number
+  useRefProtocol?: boolean
+  /** Called when the user clicks on an image. Receives the image src path. */
+  onImageClick?: (src: string) => void
 }
 
 const GRID_GAP = 1 // cell gap between images
@@ -74,10 +77,12 @@ export const InlineSlot: Component<InlineSlotProps> = (props) => {
             maxCellWidth={props.maxCellWidth}
             maxCellHeight={props.maxCellHeight}
             maxTransmitBytes={props.maxTransmitBytes}
+            useRefProtocol={props.useRefProtocol}
             caps={props.caps}
             writeOut={props.writeOut}
             renderer={props.renderer}
             fetchOptions={props.fetchOptions}
+            onImageClick={props.onImageClick}
           />
         )}
       </For>

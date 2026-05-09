@@ -23,9 +23,14 @@ export type PluginOptions = {
   // this are skipped with a placeholder to avoid hanging xterm.js. Set to 0
   // to disable the limit (safe in native terminals like kitty/Ghostty).
   maxTransmitBytes?: number
+  /** Called when the user clicks on an image. Receives the src path.
+   *  When not set and eyesPort is configured, defaults to navigating Eyes. */
+  onImageClick?: (src: string) => void
+  /** Eyes server port for click-to-navigate. Defaults to EYES_PORT env or 3400. */
+  eyesPort?: number
 }
 
-const DEFAULTS: Required<Omit<PluginOptions, "cellPixelSize">> = {
+const DEFAULTS: Required<Omit<PluginOptions, "cellPixelSize" | "onImageClick">> = {
   maxCellWidth: 30,
   maxCellHeight: 15,
   allowNetwork: true,
@@ -35,11 +40,71 @@ const DEFAULTS: Required<Omit<PluginOptions, "cellPixelSize">> = {
   allowBareUrls: true,
   showSidebar: true,
   maxTransmitBytes: 512 * 1024,
+  eyesPort: parseInt(process.env.EYES_PORT || "3400", 10),
+}
+
+// ---------------------------------------------------------------------------
+// Eyes navigation: derive a hash route from an image file path and POST to
+// the Eyes /api/navigate endpoint to open the relevant section.
+// ---------------------------------------------------------------------------
+function imagePathToEyesRoute(src: string): string | null {
+  // Find the /worlds/ segment and parse from there.
+  const idx = src.indexOf("/worlds/")
+  if (idx < 0) return null
+  const rel = src.slice(idx + "/worlds/".length) // e.g. "my-world/locations/forest/ref.png"
+  const parts = rel.split("/")
+  if (parts.length < 3) return null
+
+  const worldId = parts[0]
+  const entityType = parts[1] // "locations", "characters", "props", "projects"
+  const entityId = parts[2]
+
+  // Map plural directory names to singular Eyes route names
+  switch (entityType) {
+    case "locations":
+      return `/world/${worldId}/location/${entityId}`
+    case "characters":
+      return `/world/${worldId}/character/${entityId}`
+    case "props":
+      return `/world/${worldId}/prop/${entityId}`
+    case "projects": {
+      // .../projects/{projectId}/episodes/{episodeId}/shots/{shotId}/filename
+      if (parts.length >= 5 && parts[3] === "episodes") {
+        const projectId = entityId
+        const episodeId = parts[4]
+        if (parts.length >= 7 && parts[5] === "shots") {
+          const shotId = parts[6]
+          const filename = parts[parts.length - 1]
+          // keyframe_*.png -> keyframes view (default), video/thumb -> shots view
+          const isKeyframe = filename.startsWith("keyframe")
+          const view = isKeyframe ? "" : "view=shots&"
+          return `/world/${worldId}/project/${projectId}/episode/${episodeId}?${view}shot=${shotId}`
+        }
+        return `/world/${worldId}/project/${projectId}/episode/${episodeId}`
+      }
+      return `/world/${worldId}/project/${entityId}`
+    }
+    default:
+      return `/world/${worldId}`
+  }
+}
+
+function navigateEyes(port: number, src: string): void {
+  const route = imagePathToEyesRoute(src)
+  if (!route) return
+  fetch(`http://127.0.0.1:${port}/api/navigate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: route }),
+  }).catch(() => {
+    // Eyes not running or unreachable -- silently ignore.
+  })
 }
 
 const tui: TuiPlugin = async (api: TuiPluginApi, raw) => {
   const opts = (raw ?? {}) as PluginOptions
   const merged = { ...DEFAULTS, ...opts }
+  const handleImageClick = opts.onImageClick ?? ((src: string) => navigateEyes(merged.eyesPort, src))
   const caps = detectCapabilities(api.renderer, { cellSize: opts.cellPixelSize })
   const writeOut = makeWriteOut(api.renderer)
 
@@ -116,6 +181,8 @@ const tui: TuiPlugin = async (api: TuiPluginApi, raw) => {
             maxCellWidth={merged.maxCellWidth}
             maxCellHeight={merged.maxCellHeight}
             maxTransmitBytes={merged.maxTransmitBytes}
+            useRefProtocol={caps.forced}
+            onImageClick={handleImageClick}
           />
         )
       },

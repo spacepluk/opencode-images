@@ -4,8 +4,9 @@ import type { BoxRenderable, CliRenderer } from "@opentui/core"
 import * as kitty from "../protocols/kitty.js"
 import * as iterm2 from "../protocols/iterm2.js"
 import { maybeTmuxWrap } from "../tmux.js"
-import { fetchImage, type FetchedImage } from "../fetch.js"
+import { fetchImage, readImageDimensions, type FetchedImage } from "../fetch.js"
 import { parseImageInfo } from "../dimensions.js"
+import { isAbsolute, resolve } from "node:path"
 import type { Capabilities } from "../caps.js"
 import type { WriteOut } from "../writeOut.js"
 
@@ -89,6 +90,53 @@ async function tryDownscale(bytes: Uint8Array, maxBytes: number): Promise<Uint8A
 }
 
 // ---------------------------------------------------------------------------
+// Lightweight reference escape for Eyes/xterm.js context.
+// Format: \x1b_L<key>=<value>,<key>=<value>\x1b\\
+// Keys: p=path, i=id, c=cols, r=rows
+// Eyes' Terminal.js intercepts this and fetches the image client-side.
+// ---------------------------------------------------------------------------
+function buildRefEscape(path: string, id: number, cols: number, rows: number): string {
+  // Send the absolute path. Eyes' /api/terminal-image endpoint validates
+  // it against worldsRoot for security.
+  const safePath = path.replace(/\\/g, '/').replace(/;/g, '%3B').replace(/,/g, '%2C')
+  return `\x1b_Lp=${safePath},i=${id},c=${cols},r=${rows}\x1b\\`
+}
+
+function buildRefDelete(id: number): string {
+  return `\x1b_La=d,i=${id}\x1b\\`
+}
+
+// ---------------------------------------------------------------------------
+// Ref escape batch queue: collect ref escapes from all ImageBox instances
+// and flush them in a single writeOut call per microtask. This avoids
+// flooding the renderer with N individual writeOut calls when many images
+// mount simultaneously (e.g. terminal switch with 30+ images).
+// ---------------------------------------------------------------------------
+let _refBatch: string[] = []
+let _refBatchWriter: ((data: string | Uint8Array) => void) | null = null
+let _refBatchScheduled = false
+
+function enqueueRefEscape(escape: string, writeOut: WriteOut): void {
+  _refBatch.push(escape)
+  _refBatchWriter = writeOut
+  if (!_refBatchScheduled) {
+    _refBatchScheduled = true
+    queueMicrotask(flushRefBatch)
+  }
+}
+
+function flushRefBatch(): void {
+  _refBatchScheduled = false
+  const writer = _refBatchWriter
+  const batch = _refBatch
+  _refBatch = []
+  _refBatchWriter = null
+  if (writer && batch.length > 0) {
+    writer(batch.join(''))
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Props & helpers.
 // ---------------------------------------------------------------------------
 export type ImageBoxProps = {
@@ -103,10 +151,15 @@ export type ImageBoxProps = {
   renderer: CliRenderer
   fetchOptions: Parameters<typeof fetchImage>[1]
   maxTransmitBytes?: number
+  /** Use lightweight reference escapes instead of full kitty transmit.
+   *  Eyes sets this to true; native terminals use false (full transmit). */
+  useRefProtocol?: boolean
+  /** Called when the user clicks on the image. Receives the image src path. */
+  onImageClick?: (src: string) => void
 }
 
 type Loaded = {
-  fetched?: FetchedImage
+  fetched?: FetchedImage  // undefined in ref mode (Eyes handles the pixels)
   cellW: number
   cellH: number
   imageId: number
@@ -153,6 +206,45 @@ export const ImageBox: Component<ImageBoxProps> = (props) => {
 
 
   onMount(async () => {
+    if (props.useRefProtocol) {
+      // ── Ref protocol (Eyes/xterm.js) ──────────────────────────────
+      // Emit a lightweight escape with just the path. Eyes fetches the
+      // image client-side and calls kittyAddon.registerImage(). No heavy
+      // data goes through the terminal at all.
+      //
+      // Only read the first 4KB of the file to parse pixel dimensions
+      // for aspect-ratio computation — no full file read needed.
+      try {
+        // Resolve relative paths against fetchOptions.baseDir (project
+        // worktree), matching what fetchImage does for the full transmit
+        // path. Without this, relative paths from tool output fail.
+        let imgPath = props.src
+        if (!isAbsolute(imgPath)) {
+          const base = props.fetchOptions.baseDir ?? process.cwd()
+          imgPath = resolve(base, imgPath)
+        }
+
+        const info = await readImageDimensions(imgPath)
+        if (disposed) return
+        // File missing or not a recognized image — render nothing.
+        if (!info) return
+
+        const pseudo = { info, bytes: new Uint8Array(0), source: "file" as const, url: imgPath }
+        const { cellW, cellH } = computeCells(
+          pseudo, props.caps,
+          { cellWidth: props.cellWidth, cellHeight: props.cellHeight },
+          props.maxCellWidth, props.maxCellHeight,
+        )
+
+        const id = stableImageId(imgPath)
+        setState({ cellW, cellH, imageId: id })
+        enqueueRefEscape(buildRefEscape(imgPath, id, cellW, cellH), props.writeOut)
+      } catch {
+        // Unexpected error — render nothing.
+      }
+      return
+    }
+
     // ── Full kitty transmit (native terminals) ────────────────────
     await enqueueTransmit(async () => {
       if (disposed) return
@@ -221,6 +313,16 @@ export const ImageBox: Component<ImageBoxProps> = (props) => {
 
   onCleanup(() => {
     disposed = true
+
+    if (props.useRefProtocol) {
+      // In ref mode, do NOT emit delete escapes. The browser-side bitmap
+      // cache and addon storage serve as long-lived stores. Emitting
+      // deletes here causes a race: the TUI tears down old components
+      // (deletes) and creates new ones (async registers), but deletes
+      // arrive at the browser first and clear the images before the new
+      // registers can repopulate them, causing a visible flash-to-blank.
+      return
+    }
     if (!cacheEntry || !cacheEntryKey) return
     cacheEntry.refcount--
     if (cacheEntry.refcount <= 0) {
@@ -233,6 +335,13 @@ export const ImageBox: Component<ImageBoxProps> = (props) => {
     }
   })
 
+  const handleClick = (evt: any) => {
+    // Don't trigger click if user was selecting text
+    if (props.renderer.getSelection()?.getSelectedText()) return
+    evt?.stopPropagation?.()
+    props.onImageClick?.(props.src)
+  }
+
   return (
     <Show
       when={state()}
@@ -241,14 +350,14 @@ export const ImageBox: Component<ImageBoxProps> = (props) => {
       {(loaded) => {
         if (props.caps.protocol === "kitty") {
           return (
-            <box selectable={false}>
+            <box selectable={false} onMouseUp={handleClick}>
               <KittyPlaceholder cellW={loaded().cellW} cellH={loaded().cellH} imageId={loaded().imageId} />
             </box>
           )
         }
         if (props.caps.protocol === "iterm2") {
           return (
-            <box selectable={false}>
+            <box selectable={false} onMouseUp={handleClick}>
               <ItermBox
                 cellW={loaded().cellW}
                 cellH={loaded().cellH}
